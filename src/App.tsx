@@ -12,18 +12,22 @@ import {
   FileText,
   FolderOpen,
   GitBranch,
+  HelpCircle,
   Layers,
   LayoutDashboard,
   Loader2,
+  MessageSquare,
   Network,
   Search,
   ShieldCheck,
+  Sliders,
   Sparkles,
   TrendingUp,
   X,
 } from 'lucide-react';
-import { Decision, FullReport, QueryItem, TargetDetailReport, TargetReport } from './types';
+import { Decision, DimRow, FullReport, QueryItem, TargetDetailReport, TargetReport } from './types';
 import {
+  FieldMapping,
   loadReportInventoryFromPaths,
   RationalizationDecision,
   ReportInventory,
@@ -32,6 +36,15 @@ import {
 
 type TabKey = 'dashboard' | 'source' | 'target' | 'decision';
 type WorkbenchPhase = 'intake' | 'loading' | 'analysing' | 'ready';
+
+type IntakePayload = { mode: 'path'; sourcePath: string; targetPath: string };
+
+interface ThresholdConfig {
+  rationalizeAt: number; // overlap % at or above which disposition → Rationalize (default 100)
+  consolidateAt:  number; // overlap % at or above which disposition → Consolidate (default 70)
+}
+
+const DEFAULT_THRESHOLDS: ThresholdConfig = { rationalizeAt: 100, consolidateAt: 70 };
 
 const SOURCE_ORG = 'Source';
 const TARGET_ORG = 'Target';
@@ -97,13 +110,11 @@ function classNames(...items: Array<string | false | undefined>) {
   return items.filter(Boolean).join(' ');
 }
 
-// Decision bands — mirror server/lib/overlap.ts:
-//   overlap == 100   → Rationalize  (every source KPI subsumed by reference; retire source)
-//   70 <= overlap <= 99 → Consolidate (extend reference to absorb gap KPIs)
-//   overlap <  70    → Migrate      (insufficient coverage; rebuild)
-function decisionFromOverlap(pct: number): Decision {
-  if (pct >= 100) return 'Rationalize';
-  if (pct >= 70)  return 'Consolidate';
+// Decision bands — mirror server/lib/overlap.ts but honour user-configured thresholds.
+// Defaults match the server's static bands: 100 → Rationalize, 70–99 → Consolidate, <70 → Migrate.
+function decisionFromOverlap(pct: number, thresholds: ThresholdConfig = DEFAULT_THRESHOLDS): Decision {
+  if (pct >= thresholds.rationalizeAt) return 'Rationalize';
+  if (pct >= thresholds.consolidateAt)  return 'Consolidate';
   return 'Migrate';
 }
 
@@ -175,7 +186,8 @@ function getSourceDecision(source: FullReport, decisions: RationalizationDecisio
 // Build dispositions directly from the inventory's deterministic overlap.
 // These are visible immediately after load from deterministic overlap.
 // Later enrichment can improve `rationale` / `kpiGaps` / `confidenceScore` only.
-function deterministicDecisions(inventory: ReportInventory): RationalizationDecision[] {
+// Thresholds are applied client-side to allow live recomputation when the user adjusts them.
+function deterministicDecisions(inventory: ReportInventory, thresholds: ThresholdConfig = DEFAULT_THRESHOLDS): RationalizationDecision[] {
   return inventory.sources.map(s => ({
     sourceId:        s.id,
     sourceName:      s.name,
@@ -183,7 +195,7 @@ function deterministicDecisions(inventory: ReportInventory): RationalizationDeci
     targetId:        s.bestMatchTargetId,
     targetName:      s.bestMatchTargetName,
     overlapPercent:  s.overlapPercent,
-    decision:        s.decision,
+    decision:        decisionFromOverlap(s.overlapPercent, thresholds),
     confidenceScore: s.confidenceScore,
     rationale:       s.analysisExplanation,
     kpiGaps:         s.kpiDelta.filter(k => k.missingInTarget).map(k => k.name),
@@ -202,9 +214,9 @@ function placeholderSource(): FullReport {
     overlapPercent: 0, decision: 'Migrate', status: 'Pending',
     confidenceScore: 0, analysisExplanation: '', topCandidates: [],
     description: 'Load report folders from the Dashboard tab to view source report details.',
-    allKpis: [], allTables: [],
+    allKpis: [], allTables: [], allDimensions: [],
     queries: { source: [], target: [] },
-    kpiDelta: [],
+    kpiDelta: [], dimensionDelta: [],
   };
 }
 
@@ -212,7 +224,7 @@ function placeholderTarget(): TargetDetailReport {
   return {
     id: '—', name: '—', domain: '—', owner: '—',
     description: 'Load report folders from the Dashboard tab to view reference report details.',
-    numQueries: 0, queries: [], kpis: [], allTables: [],
+    numQueries: 0, queries: [], kpis: [], allTables: [], allDimensions: [],
   };
 }
 
@@ -867,23 +879,19 @@ function IntakeBanner({
   onApply,
   loading = false,
 }: {
-  onApply: (sourcePath: string, targetPath: string) => void;
+  onApply: (payload: IntakePayload) => void;
   loading?: boolean;
 }) {
   const [sourcePath, setSourcePath] = useState('');
   const [targetPath, setTargetPath] = useState('');
-  const [notes, setNotes] = useState('');
-  const [expanded, setExpanded] = useState(false);
+  const [notes, setNotes]           = useState('');
+  const [expanded, setExpanded]     = useState(false);
 
   const canSubmit = sourcePath.trim().length > 0 && targetPath.trim().length > 0 && !loading;
 
   const handleApply = () => {
     if (!canSubmit) return;
-    onApply(sourcePath.trim(), targetPath.trim());
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && canSubmit) handleApply();
+    onApply({ mode: 'path', sourcePath: sourcePath.trim(), targetPath: targetPath.trim() });
   };
 
   return (
@@ -904,9 +912,9 @@ function IntakeBanner({
               className="intake-path-input"
               value={sourcePath}
               onChange={e => setSourcePath(e.target.value)}
-              onKeyDown={handleKeyDown}
+              onKeyDown={e => e.key === 'Enter' && canSubmit && handleApply()}
               disabled={loading}
-              placeholder="Local folder path — e.g. C:\reports\source"
+              placeholder="Source folder path — e.g. /reports/source"
             />
           </div>
           <div className="intake-path-row">
@@ -915,9 +923,9 @@ function IntakeBanner({
               className="intake-path-input"
               value={targetPath}
               onChange={e => setTargetPath(e.target.value)}
-              onKeyDown={handleKeyDown}
+              onKeyDown={e => e.key === 'Enter' && canSubmit && handleApply()}
               disabled={loading}
-              placeholder="Local folder path — e.g. C:\reports\reference"
+              placeholder="Reference folder path — e.g. /reports/reference"
             />
           </div>
         </div>
@@ -1018,7 +1026,6 @@ function AppHeader({
     <header className="enterprise-header">
       <div className="hero-strip">
         <div className="brand-lockup">
-          <div className="brand-emblem"><BarChart3 size={22} /></div>
           <div>
             <p className="eyebrow">BI Modernization Workbench</p>
             <h1>Report Rationalizer</h1>
@@ -1049,26 +1056,42 @@ function AppHeader({
 function DashboardView({
   inventory,
   decisions,
+  thresholds,
   onReload,
+  onThresholdChange,
+  onRemap,
   isLoading,
   loadError,
 }: {
   inventory: ReportInventory | null;
   decisions: RationalizationDecision[];
-  onReload: (sourcePath: string, targetPath: string) => void;
+  thresholds: ThresholdConfig;
+  onReload: (payload: IntakePayload) => void;
+  onThresholdChange: (t: ThresholdConfig) => void;
+  onRemap: (sourceId: string) => void;
   isLoading: boolean;
   loadError: string | null;
 }) {
   const allSources = inventory?.sources ?? [];
   const allTargets = inventory?.targets ?? [];
 
-  // ── Domain filter ────────────────────────────────────────────────────────
-  const [activeDomain, setActiveDomain] = useState<string>('All');
+  // ── Multi-select domain filter ──────────────────────────────────────────
+  // activeDomains = [] means "All". Each chip toggles membership in the set.
+  const [activeDomains, setActiveDomains] = useState<string[]>([]);
+  const [remapTableOpen, setRemapTableOpen] = useState(false);
   const allDomains = [...new Set(allSources.map(r => r.domain))].sort();
 
-  const sources  = activeDomain === 'All' ? allSources : allSources.filter(r => r.domain === activeDomain);
-  const targets  = activeDomain === 'All' ? allTargets : allTargets.filter(r => r.domain === activeDomain);
-  const decisions_f = activeDomain === 'All' ? decisions  : decisions.filter(d => d.domain === activeDomain);
+  const toggleDomain = (d: string) => {
+    setActiveDomains(prev =>
+      prev.includes(d) ? prev.filter(x => x !== d) : [...prev, d]
+    );
+  };
+
+  const isAllActive = activeDomains.length === 0;
+
+  const sources  = isAllActive ? allSources : allSources.filter(r => activeDomains.includes(r.domain));
+  const targets  = isAllActive ? allTargets : allTargets.filter(r => activeDomains.includes(r.domain));
+  const decisions_f = isAllActive ? decisions  : decisions.filter(d => activeDomains.includes(d.domain));
 
   const mapped = decisions_f.length;
   const avgConfidence = mapped
@@ -1100,7 +1123,7 @@ function DashboardView({
 
   const totalKpiGaps = decisions_f.reduce((s, d) => s + (d.kpiGaps?.length ?? 0), 0);
 
-  const domainCounts = (activeDomain === 'All' ? allDomains : [activeDomain]).map(domain => ({
+  const domainCounts = (isAllActive ? allDomains : activeDomains).map(domain => ({
     domain,
     sources:   allSources.filter(r => r.domain === domain).length,
     targets:   allTargets.filter(r => r.domain === domain).length,
@@ -1129,32 +1152,39 @@ function DashboardView({
         <div className="no-data-banner">
           <AlertCircle size={14} />
           <span>
-            Enter your source and reference folder paths above and click <strong>Load reports</strong>.
+            Paste the source and reference report folder paths above and click <strong>Load reports</strong>.
             All metrics, charts, lineage, and analysis will populate once data is loaded.
           </span>
         </div>
       )}
       {isLoading && <LoadingProgressPanel />}
 
-      {/* Domain filter bar — only shown when data is loaded */}
+      {/* Threshold configuration panel */}
+      <ThresholdPanel thresholds={thresholds} onChange={onThresholdChange} />
+
+      {/* Domain filter bar — multi-select, only shown when data is loaded */}
       {allSources.length > 0 && !isLoading && (
         <div className="domain-filter-bar">
           <span className="domain-filter-label">Domain</span>
-          {['All', ...allDomains].map(d => (
+          <button
+            className={classNames('domain-filter-chip', isAllActive && 'active')}
+            onClick={() => setActiveDomains([])}
+          >
+            All
+          </button>
+          {allDomains.map(d => (
             <button
               key={d}
-              className={classNames('domain-filter-chip', activeDomain === d && 'active')}
-              onClick={() => setActiveDomain(d)}
+              className={classNames('domain-filter-chip', activeDomains.includes(d) && 'active')}
+              onClick={() => toggleDomain(d)}
             >
               {d}
-              {d !== 'All' && (
-                <span className="domain-chip-count">
-                  {decisions.filter(dec => dec.domain === d).length}
-                </span>
-              )}
+              <span className="domain-chip-count">
+                {decisions.filter(dec => dec.domain === d).length}
+              </span>
             </button>
           ))}
-          {activeDomain !== 'All' && (
+          {!isAllActive && (
             <span className="domain-filter-summary">
               Showing {sources.length} source · {targets.length} reference · {mapped} decisions
               &nbsp;—&nbsp;
@@ -1331,6 +1361,78 @@ function DashboardView({
           </div>
         </section>
       </div>
+
+      {/* Quick Remap — collapsible source list with Remap action */}
+      {allSources.length > 0 && !isLoading && (
+        <section className="panel quick-remap-panel">
+          <div className="panel-heading quick-remap-heading" onClick={() => setRemapTableOpen(v => !v)} style={{ cursor: 'pointer' }}>
+            <div>
+              <p className="panel-kicker">Source reports · remap</p>
+              <h2>Quick remap</h2>
+            </div>
+            <span className="panel-badge">{sources.length} source reports</span>
+            <ChevronDown size={14} style={{ transform: remapTableOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.2s' }} />
+          </div>
+          {remapTableOpen && (
+            <div className="table-scroll">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Source report</th>
+                    <th>Domain</th>
+                    <th>Current reference</th>
+                    <th>Overlap</th>
+                    <th>Disposition</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sources.length === 0 ? (
+                    <tr className="placeholder-row"><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
+                  ) : sources.map(src => {
+                    const dec = decisions.find(d => d.sourceId === src.id);
+                    const overlap = dec?.overlapPercent ?? src.overlapPercent;
+                    const targetName = dec?.targetName ?? src.bestMatchTargetName;
+                    const disposition = dec?.decision ?? src.decision;
+                    return (
+                      <tr key={src.id}>
+                        <td>
+                          <strong>{src.name}</strong>
+                          <span className="subtext">{src.id}</span>
+                        </td>
+                        <td>{src.domain}</td>
+                        <td>{targetName ?? <span className="subtext">—</span>}</td>
+                        <td>
+                          <div className="mini-overlap">
+                            <span>{formatPercent(overlap)}</span>
+                            <div><i style={{ width: `${overlap}%`, background: overlapColor(overlap) }} /></div>
+                          </div>
+                        </td>
+                        <td><DecisionPill decision={disposition} /></td>
+                        <td>
+                          <button className="remap-btn" onClick={() => onRemap(src.id)}>
+                            Remap
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
+      <HelpChatBox
+        tab="dashboard"
+        ctx={{
+          thresholds,
+          sourceCount: allSources.length,
+          targetCount: allTargets.length,
+          decisionCount: decisions.length,
+        }}
+      />
     </main>
   );
 }
@@ -1963,6 +2065,7 @@ function DecisionView({
 
   return (
     <main className="workspace decision-workspace">
+      <HelpChatBox tab="decision" ctx={{ thresholds: DEFAULT_THRESHOLDS, sourceCount: sources.length, targetCount: targets.length, decisionCount: decisions.length }} />
       <section className="panel decision-table-panel">
         <div className="panel-heading">
           <div>
@@ -2156,6 +2259,7 @@ function RemapModal({
   allTargets,
   allDomains,
   existing,
+  thresholds,
   onClose,
   onApply,
 }: {
@@ -2163,12 +2267,33 @@ function RemapModal({
   allTargets: TargetDetailReport[];
   allDomains: string[];
   existing: RationalizationDecision | null;
+  thresholds: ThresholdConfig;
   onClose: () => void;
   onApply: (updated: RationalizationDecision) => void;
 }) {
-  const [newTargetId, setNewTargetId] = useState(existing?.targetId ?? allTargets[0]?.id ?? '');
-  const [newDomain,   setNewDomain]   = useState(existing?.domain   ?? source.domain);
-  const [reason,      setReason]      = useState('');
+  const [newTargetId,    setNewTargetId]    = useState(existing?.targetId ?? allTargets[0]?.id ?? '');
+  const [newDomain,      setNewDomain]      = useState(existing?.domain   ?? source.domain);
+  const [focusKpi,       setFocusKpi]       = useState('');
+  const [reason,         setReason]         = useState('');
+  const [fieldMappings,  setFieldMappings]  = useState<FieldMapping[]>([]);
+  const [showFieldMap,   setShowFieldMap]   = useState(false);
+
+  // Build field mappings whenever the resolved target changes.
+  const buildFieldMappings = useCallback((tgt: TargetDetailReport | null): FieldMapping[] => {
+    if (!tgt) return [];
+    const srcKpis = source.allKpis.filter((k, i, arr) => arr.findIndex(x => x.alias === k.alias) === i);
+    return srcKpis.map(k => {
+      const exactMatch = tgt.kpis.find(t => t.alias === k.alias) ?? null;
+      const colMatch   = !exactMatch ? (tgt.kpis.find(t => t.column === k.column) ?? null) : null;
+      const matched    = exactMatch ?? colMatch;
+      return {
+        sourceAlias:  k.alias,
+        sourceColumn: k.column,
+        targetAlias:  matched?.alias  ?? null,
+        targetColumn: matched?.column ?? null,
+      };
+    });
+  }, [source]);
 
   // When domain changes, auto-select the best-matching target in that domain
   // so overlap / confidence / KPI gaps recompute against a relevant reference.
@@ -2183,21 +2308,43 @@ function RemapModal({
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newDomain]);
 
-  // Targets for the dropdown: domain-filtered pool first, then the rest separated
-  const domainTargets = allTargets.filter(t => t.domain === newDomain);
-  const otherTargets  = allTargets.filter(t => t.domain !== newDomain);
+  // Reinitialise field mappings whenever the target selection changes.
+  useEffect(() => {
+    const tgt = allTargets.find(t => t.id === newTargetId) ?? null;
+    setFieldMappings(buildFieldMappings(tgt));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [newTargetId]);
+
+  // Targets for the dropdown: domain-filtered pool first, then rest.
+  // When a focus KPI is set, within each group sort targets that cover it to the top.
+  const rankTarget = (t: TargetDetailReport) =>
+    focusKpi ? (t.kpis.some(k => k.alias === focusKpi) ? 0 : 1) : 0;
+
+  const domainTargets = [...allTargets.filter(t => t.domain === newDomain)]
+    .sort((a, b) => rankTarget(a) - rankTarget(b));
+  const otherTargets  = [...allTargets.filter(t => t.domain !== newDomain)]
+    .sort((a, b) => rankTarget(a) - rankTarget(b));
 
   const newTarget  = allTargets.find(t => t.id === newTargetId) ?? null;
   const overlap    = newTarget ? clientComputeOverlap(source, newTarget) : 0;
-  const decision   = decisionFromOverlap(overlap);
+  const decision   = decisionFromOverlap(overlap, thresholds);
   const kpiGaps    = newTarget ? clientKpiGaps(source, newTarget) : [];
   const confidence = clientConfidence(overlap);
+
+  const sourceKpiAliases = [...new Set(source.allKpis.map(k => k.alias))].sort();
+  const focusKpiCoveredByTarget = focusKpi && newTarget
+    ? newTarget.kpis.some(k => k.alias === focusKpi)
+    : null;
 
   const isDomainChanged  = newDomain   !== (existing?.domain ?? source.domain);
   const isTargetChanged  = newTargetId !== (existing?.targetId ?? source.bestMatchTargetId);
   const hasChanges = isDomainChanged || isTargetChanged;
 
   const handleApply = () => {
+    const manualMappings = fieldMappings.filter(m => {
+      const isAuto = newTarget?.kpis.some(k => k.alias === m.sourceAlias) ?? false;
+      return !isAuto && m.targetAlias !== null;
+    });
     onApply({
       sourceId:        source.id,
       sourceName:      source.name,
@@ -2212,10 +2359,11 @@ function RemapModal({
             kpiGaps.length
               ? `${kpiGaps.length} KPI gap(s): ${kpiGaps.slice(0, 4).join(', ')}${kpiGaps.length > 4 ? '…' : ''}.`
               : 'All source KPIs covered.'
-          }`,
+          }${manualMappings.length ? ` ${manualMappings.length} manual field mapping(s) captured.` : ''}`,
       kpiGaps,
-      status:  'Overridden',
-      source:  'manual',
+      status:          'Overridden',
+      source:          'manual',
+      fieldMappings:   fieldMappings.length > 0 ? fieldMappings : undefined,
     });
   };
 
@@ -2256,20 +2404,40 @@ function RemapModal({
           </label>
 
           <label>
+            Focus KPI / column <span className="modal-optional-hint">(optional — highlights coverage in the reference list)</span>
+            <select value={focusKpi} onChange={e => setFocusKpi(e.target.value)}>
+              <option value="">— none —</option>
+              {sourceKpiAliases.map(alias => (
+                <option key={alias} value={alias}>{alias}</option>
+              ))}
+            </select>
+          </label>
+
+          <label>
             New reference report
             <select value={newTargetId} onChange={e => setNewTargetId(e.target.value)}>
               {domainTargets.length > 0 && (
                 <optgroup label={`${newDomain} (${domainTargets.length})`}>
-                  {domainTargets.map(t => (
-                    <option key={t.id} value={t.id}>{t.name}</option>
-                  ))}
+                  {domainTargets.map(t => {
+                    const coversFocus = focusKpi ? t.kpis.some(k => k.alias === focusKpi) : null;
+                    return (
+                      <option key={t.id} value={t.id}>
+                        {coversFocus === true ? '✓ ' : coversFocus === false ? '✗ ' : ''}{t.name}
+                      </option>
+                    );
+                  })}
                 </optgroup>
               )}
               {otherTargets.length > 0 && (
                 <optgroup label="Other domains">
-                  {otherTargets.map(t => (
-                    <option key={t.id} value={t.id}>{t.name} ({t.domain})</option>
-                  ))}
+                  {otherTargets.map(t => {
+                    const coversFocus = focusKpi ? t.kpis.some(k => k.alias === focusKpi) : null;
+                    return (
+                      <option key={t.id} value={t.id}>
+                        {coversFocus === true ? '✓ ' : coversFocus === false ? '✗ ' : ''}{t.name} ({t.domain})
+                      </option>
+                    );
+                  })}
                 </optgroup>
               )}
             </select>
@@ -2284,6 +2452,88 @@ function RemapModal({
               placeholder="Explain why this report is being remapped…"
             />
           </label>
+
+          {/* Field mapping section */}
+          {newTarget && fieldMappings.length > 0 && (
+            <div className="field-map-section">
+              <button
+                type="button"
+                className="field-map-toggle"
+                onClick={() => setShowFieldMap(v => !v)}
+              >
+                <ChevronDown size={13} style={{ transform: showFieldMap ? 'rotate(180deg)' : undefined, transition: 'transform 0.2s' }} />
+                Metadata field mapping
+                <span className="field-map-badge">
+                  {fieldMappings.filter(m => m.targetAlias !== null).length}/{fieldMappings.length} mapped
+                </span>
+                {fieldMappings.some(m => {
+                  const isAuto = newTarget.kpis.some(k => k.alias === m.sourceAlias);
+                  return !isAuto && m.targetAlias === null;
+                }) && (
+                  <span className="field-map-badge gap">
+                    {fieldMappings.filter(m => {
+                      const isAuto = newTarget.kpis.some(k => k.alias === m.sourceAlias);
+                      return !isAuto && m.targetAlias === null;
+                    }).length} unmapped
+                  </span>
+                )}
+              </button>
+
+              {showFieldMap && (
+                <div className="field-map-grid">
+                  <div className="field-map-header-row">
+                    <span>Source field</span>
+                    <span></span>
+                    <span>Target field</span>
+                    <span>Status</span>
+                  </div>
+                  {fieldMappings.map((fm, i) => {
+                    const isAuto    = newTarget.kpis.some(k => k.alias === fm.sourceAlias);
+                    const isManual  = !isAuto && fm.targetAlias !== null;
+                    const isGap     = !isAuto && fm.targetAlias === null;
+                    const statusCls = isAuto ? 'auto' : isManual ? 'manual' : 'gap';
+                    const statusTxt = isAuto ? '✓ auto' : isManual ? '✓ manual' : '✗ gap';
+                    return (
+                      <div key={fm.sourceAlias} className={`field-map-row ${statusCls}`}>
+                        <div className="field-map-cell">
+                          <span className="field-map-alias">{fm.sourceAlias}</span>
+                          <span className="field-map-col">{fm.sourceColumn}</span>
+                        </div>
+                        <span className="field-map-arrow">→</span>
+                        {isAuto ? (
+                          <div className="field-map-cell locked">
+                            <span className="field-map-alias">{fm.targetAlias}</span>
+                            <span className="field-map-col">{fm.targetColumn}</span>
+                          </div>
+                        ) : (
+                          <select
+                            className="field-map-select"
+                            value={fm.targetAlias ?? ''}
+                            onChange={e => {
+                              const picked = newTarget.kpis.find(k => k.alias === e.target.value) ?? null;
+                              setFieldMappings(prev => prev.map((m, j) => j !== i ? m : {
+                                ...m,
+                                targetAlias:  picked?.alias  ?? null,
+                                targetColumn: picked?.column ?? null,
+                              }));
+                            }}
+                          >
+                            <option value="">— unmatched —</option>
+                            {newTarget.kpis.map(k => (
+                              <option key={k.alias} value={k.alias}>
+                                {k.alias} ({k.column})
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                        <span className={`field-map-status ${statusCls}`}>{statusTxt}</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Live recomputed result */}
@@ -2314,6 +2564,14 @@ function RemapModal({
                   {kpiGaps.length}
                 </strong>
               </div>
+              {focusKpiCoveredByTarget !== null && (
+                <div className="remap-result-item remap-focus-kpi-result">
+                  <span>Focus KPI "{focusKpi}"</span>
+                  <span className={classNames('coverage-flag', focusKpiCoveredByTarget ? 'ok' : 'gap')}>
+                    {focusKpiCoveredByTarget ? '✓ covered' : '✗ gap'}
+                  </span>
+                </div>
+              )}
             </div>
             {kpiGaps.length > 0 && (
               <div className="remap-kpi-gaps">
@@ -2470,11 +2728,14 @@ function SourceView({
         : null);
   const events = buildSourceTrail(selected, decision, targets.length, phase, timings);
 
-  const kpis   = selected.allKpis;
-  const tables = selected.allTables;
+  const kpis       = selected.allKpis;
+  const tables     = selected.allTables;
+  const dimDelta   = selected.dimensionDelta ?? [];
+  const dimensions = selected.allDimensions ?? [];
 
   return (
     <main className="workspace three-column">
+      <HelpChatBox tab="source" ctx={{ thresholds: DEFAULT_THRESHOLDS, sourceCount: sources.length, targetCount: targets.length, decisionCount: decisions.length }} />
       <Sidebar title="Source reports" items={sources} selectedId={selected.id} onSelect={setSelectedId} />
 
       <div className="record-workspace">
@@ -2524,6 +2785,7 @@ function SourceView({
                 <div className="context-metrics">
                   <span><strong>{selected.usageFrequency}</strong> weekly uses</span>
                   <span><strong>{selected.kpiDelta.filter(k => k.missingInTarget).length}</strong> KPI gaps</span>
+                  <span><strong>{dimDelta.filter((d: DimRow) => d.missingInTarget).length}</strong> Dim gaps</span>
                   <span>
                     <strong>{decision?.targetName ?? selected.bestMatchTargetName ?? 'Analysis pending'}</strong>
                     Mapped reference
@@ -2571,6 +2833,34 @@ function SourceView({
                 </table>
               </div>
             </section>
+
+            {/* Dimension fields comparison */}
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <p className="panel-kicker">Dimensions · vs reference</p>
+                  <h2>Dimension field comparison</h2>
+                </div>
+                <span className="panel-badge">{dimensions.length} fields</span>
+              </div>
+              {dimensions.length === 0 ? (
+                <p className="panel-empty-note">No GROUP BY dimensions extracted — SQL queries may use inline expressions or this report uses a non-SQL format.</p>
+              ) : (
+                <div className="dim-delta-grid">
+                  {dimDelta.map((d: DimRow) => (
+                    <div key={d.name} className={`dim-delta-chip ${d.missingInTarget ? 'missing' : 'present'}`}>
+                      <span className="dim-delta-icon">{d.missingInTarget ? '✗' : '✓'}</span>
+                      <span className="dim-delta-name">{d.name}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {dimDelta.some((d: DimRow) => d.missingInTarget) && (
+                <p className="dim-delta-note">
+                  <strong>{dimDelta.filter((d: DimRow) => d.missingInTarget).length}</strong> dimension{dimDelta.filter((d: DimRow) => d.missingInTarget).length !== 1 ? 's' : ''} missing from the reference report — add as grouping attributes to support full analytical parity.
+                </p>
+              )}
+            </section>
           </>
         )}
       </div>
@@ -2605,9 +2895,11 @@ function TargetView({
   const events       = buildTargetTrail(selected, sourceCount, phase, timings);
   const kpis         = selected.kpis;
   const tables       = selected.allTables;
+  const dimensions   = selected.allDimensions ?? [];
 
   return (
     <main className="workspace three-column">
+      <HelpChatBox tab="target" ctx={{ thresholds: DEFAULT_THRESHOLDS, sourceCount: sourceCount, targetCount: targets.length, decisionCount: 0 }} />
       <Sidebar title="Target reports" items={targets} selectedId={selected.id} onSelect={setSelectedId} />
 
       <div className="record-workspace">
@@ -2687,6 +2979,28 @@ function TargetView({
                   </tbody>
                 </table>
               </div>
+            </section>
+            {/* Dimension fields */}
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <p className="panel-kicker">Dimensions</p>
+                  <h2>Reference dimension fields</h2>
+                </div>
+                <span className="panel-badge">{dimensions.length} fields</span>
+              </div>
+              {dimensions.length === 0 ? (
+                <p className="panel-empty-note">No GROUP BY dimensions extracted — SQL queries may use inline expressions or this report uses a non-SQL format.</p>
+              ) : (
+                <div className="dim-delta-grid">
+                  {dimensions.map(d => (
+                    <div key={d} className="dim-delta-chip present">
+                      <span className="dim-delta-icon">✓</span>
+                      <span className="dim-delta-name">{d}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </section>
           </>
         )}
@@ -2783,6 +3097,243 @@ function LoadingProgressPanel() {
   );
 }
 
+// ---- Threshold panel ----
+// Lets analysts define their own % cut-offs for Rationalize / Consolidate / Migrate.
+// Changing a threshold instantly recomputes all non-manual decisions via an App-level effect.
+
+function ThresholdPanel({
+  thresholds,
+  onChange,
+}: {
+  thresholds: ThresholdConfig;
+  onChange: (t: ThresholdConfig) => void;
+}) {
+  const isDefault =
+    thresholds.rationalizeAt === DEFAULT_THRESHOLDS.rationalizeAt &&
+    thresholds.consolidateAt  === DEFAULT_THRESHOLDS.consolidateAt;
+
+  const setRat = (v: number) => {
+    const rat = Math.min(100, Math.max(thresholds.consolidateAt + 1, v));
+    onChange({ ...thresholds, rationalizeAt: rat });
+  };
+
+  const setCon = (v: number) => {
+    const con = Math.min(thresholds.rationalizeAt - 1, Math.max(1, v));
+    onChange({ ...thresholds, consolidateAt: con });
+  };
+
+  const migrateWidth    = thresholds.consolidateAt;
+  const consolidateWidth = thresholds.rationalizeAt - thresholds.consolidateAt;
+  const rationalizeWidth = 100 - thresholds.rationalizeAt + 1;
+
+  return (
+    <div className="threshold-panel">
+      <div className="threshold-header">
+        <Sliders size={14} />
+        <span>Disposition thresholds</span>
+        {!isDefault && (
+          <button className="threshold-reset-btn" onClick={() => onChange(DEFAULT_THRESHOLDS)}>
+            Reset to defaults
+          </button>
+        )}
+      </div>
+      <div className="threshold-controls">
+        <label className="threshold-label">
+          <span>Rationalize at ≥</span>
+          <div className="threshold-input-row">
+            <input
+              type="range" min={thresholds.consolidateAt + 1} max={100} step={1}
+              value={thresholds.rationalizeAt}
+              onChange={e => setRat(Number(e.target.value))}
+            />
+            <input
+              type="number" min={thresholds.consolidateAt + 1} max={100}
+              value={thresholds.rationalizeAt}
+              onChange={e => setRat(Number(e.target.value))}
+              className="threshold-num-input"
+            />
+            <span>%</span>
+          </div>
+        </label>
+        <label className="threshold-label">
+          <span>Consolidate at ≥</span>
+          <div className="threshold-input-row">
+            <input
+              type="range" min={1} max={thresholds.rationalizeAt - 1} step={1}
+              value={thresholds.consolidateAt}
+              onChange={e => setCon(Number(e.target.value))}
+            />
+            <input
+              type="number" min={1} max={thresholds.rationalizeAt - 1}
+              value={thresholds.consolidateAt}
+              onChange={e => setCon(Number(e.target.value))}
+              className="threshold-num-input"
+            />
+            <span>%</span>
+          </div>
+        </label>
+      </div>
+      <div className="threshold-scale">
+        <div className="threshold-band migrate">
+          Migrate &lt;{thresholds.consolidateAt}%
+        </div>
+        <div className="threshold-band consolidate">
+          Consolidate {thresholds.consolidateAt}–{thresholds.rationalizeAt - 1}%
+        </div>
+        <div className="threshold-band rationalize">
+          Rationalize ≥{thresholds.rationalizeAt}%
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---- Help chat box ----
+// Contextual, data-aware FAQ panel surfaced on every tab via a floating toggle button.
+
+interface HelpItem {
+  q: string;
+  a: string;
+}
+
+function buildHelpItems(tab: TabKey, ctx: {
+  thresholds: ThresholdConfig;
+  sourceCount: number;
+  targetCount: number;
+  decisionCount: number;
+}): HelpItem[] {
+  const { thresholds, sourceCount, targetCount, decisionCount } = ctx;
+  if (tab === 'dashboard') return [
+    {
+      q: 'What do the disposition thresholds control?',
+      a: `The three bands are defined by two cut-offs. Any source with KPI overlap ≥ ${thresholds.rationalizeAt}% is recommended for Rationalize (retire). Overlap between ${thresholds.consolidateAt}% and ${thresholds.rationalizeAt - 1}% maps to Consolidate (extend the reference). Below ${thresholds.consolidateAt}% maps to Migrate (rebuild). Changing a slider instantly reclassifies all non-manual decisions.`,
+    },
+    {
+      q: 'What is KPI overlap % and how is it calculated?',
+      a: 'Overlap is a weighted score: KPI alias match (50%) + column name match (30%) + normalised table name match (20%). A source KPI alias is matched if the same name appears in the reference report\'s KPI list. Table names are normalised by stripping vendor prefixes (fact_, dim_, tgt_, vz_, etc.) before comparison.',
+    },
+    {
+      q: 'What does Remap do on the Dashboard?',
+      a: 'Remap lets you point any source report at a different reference report or domain and immediately see the recomputed overlap %, disposition band, confidence score, and KPI gaps — before confirming. Use it when the automatic best-match looks wrong or when the business domain should be reassigned.',
+    },
+    {
+      q: 'How does the multi-select domain filter work?',
+      a: 'Click one or more domain chips to narrow all stat cards, disposition bars, overlap buckets, and confidence tiers. Clicking an already-active chip deselects it. When no domain is selected, "All" is shown and all domains are included.',
+    },
+    {
+      q: `Why do I see ${decisionCount} decisions for ${sourceCount} sources?`,
+      a: sourceCount === decisionCount
+        ? `Every source report has a disposition — one per source. ${targetCount} reference reports were evaluated as candidates.`
+        : `Decisions populate after loading reports. ${decisionCount} of ${sourceCount} source reports have been matched so far.`,
+    },
+  ];
+
+  if (tab === 'source') return [
+    {
+      q: 'What is the Coverage Matrix?',
+      a: 'The Coverage Matrix compares the selected source report\'s KPIs one-by-one against the best-matched reference report. Green ✓ means the alias or column is present in the reference; red ✗ means it is a gap that would need to be added before the source can be retired.',
+    },
+    {
+      q: 'How are KPIs extracted from SQL?',
+      a: 'The parser scans every SQL file in the report folder for the pattern AGG(table.column) AS alias, where AGG is one of SUM, COUNT, AVG, MIN, or MAX. Each match produces one KPI row: alias, aggregation, column, and formula. Dimension columns (non-aggregated) appear in the table dependencies panel but do not affect the overlap score.',
+    },
+    {
+      q: 'What do the alias/column match weights mean?',
+      a: 'Alias match carries 50% of the total score because the KPI name is the strongest semantic signal — two reports are likely equivalent if they compute the same named measure. Column match (30%) validates the underlying data field. Table match (20%) confirms the same dimensional structure, after stripping vendor-specific prefixes.',
+    },
+    {
+      q: 'What does the Rationalization Trail show?',
+      a: 'The trail on the right logs each step of the analysis pipeline — from SQL ingestion and KPI extraction through to threshold evaluation and the final recommendation. Each event carries a phase badge, a status indicator (done / active / queued), and a timestamp where available.',
+    },
+  ];
+
+  if (tab === 'target') return [
+    {
+      q: 'What is a reference report?',
+      a: 'Reference reports form the governed target catalog — the destination that source reports should be rationalised into. Each reference report defines the canonical KPI set for its domain. A source report\'s disposition (Rationalize / Consolidate / Migrate) is determined by how much of its KPI set is already covered by the best-matching reference.',
+    },
+    {
+      q: 'Why are some table names normalised?',
+      a: 'Source schemas often use vendor-specific prefixes (fact_, dim_, ref_) while reference schemas use platform-specific ones (tgt_, vz_, mkt_). The normaliser strips these prefixes before matching so that fact_sales and tgt_sales are treated as equivalent, avoiding false negatives caused by naming conventions rather than semantic differences.',
+    },
+    {
+      q: 'How many source reports can match one reference?',
+      a: `Multiple source reports can point to the same reference. The current reference catalog has ${targetCount} report(s); ${sourceCount} source report(s) have been evaluated against them. The Disposition tab shows the full many-to-one mapping.`,
+    },
+  ];
+
+  // disposition tab
+  return [
+    {
+      q: 'What do Approve, Override, and Remap do?',
+      a: 'Approve marks the AI-generated disposition as analyst-confirmed. Override lets you manually set a different decision, target, overlap %, and rationale — this is recorded as a manual governance action. Remap reassigns the source to a different domain and/or reference and instantly recomputes overlap, decision, KPI gaps, and confidence using the same formula as the server.',
+    },
+    {
+      q: 'What does "Pending" status mean?',
+      a: 'Pending means the disposition has been generated but not yet reviewed by an analyst. Approved means an analyst confirmed it as-is. Overridden means an analyst manually set a different decision. You can filter by status to find all pending items that still need governance sign-off.',
+    },
+    {
+      q: 'How is confidence computed?',
+      a: 'Confidence is a heuristic: 0.40 + (overlap / 100) × 0.55. A 100% overlap produces ~0.95 (95%); 0% overlap produces 0.40 (40%). When rationale enrichment is enabled, the enrichment model may adjust this score based on the semantic quality of the KPI evidence.',
+    },
+    {
+      q: 'What are KPI gaps and why do they matter?',
+      a: 'KPI gaps are KPI aliases present in the source report but absent from the matched reference. A Consolidate disposition requires the reference to be extended to cover these gaps before the source can be retired. For a Migrate disposition, the full source capability must be rebuilt on the governed platform.',
+    },
+    {
+      q: 'Can I export the disposition matrix?',
+      a: 'Yes — click the "Export CSV" button in the panel header to download all dispositions, overlap scores, confidence ratings, KPI gap counts, statuses, and rationale as a CSV file.',
+    },
+  ];
+}
+
+function HelpChatBox({ tab, ctx }: {
+  tab: TabKey;
+  ctx: Parameters<typeof buildHelpItems>[1];
+}) {
+  const [open, setOpen]               = useState(false);
+  const [expandedIdx, setExpandedIdx] = useState<number | null>(null);
+  const items = buildHelpItems(tab, ctx);
+
+  return (
+    <div className="help-chat-root">
+      <button
+        className={classNames('help-toggle-btn', open && 'active')}
+        onClick={() => setOpen(v => !v)}
+        title={open ? 'Close help' : 'Open contextual help'}
+      >
+        <HelpCircle size={18} />
+      </button>
+      {open && (
+        <div className="help-chat-panel">
+          <div className="help-chat-header">
+            <MessageSquare size={13} />
+            <span>Workbench help</span>
+            <span className="help-chat-tab-badge">{tab}</span>
+            <button onClick={() => setOpen(false)} aria-label="Close help"><X size={14} /></button>
+          </div>
+          <div className="help-chat-items">
+            {items.map((item, i) => (
+              <div key={i} className={classNames('help-item', expandedIdx === i && 'expanded')}>
+                <button
+                  className="help-item-q"
+                  onClick={() => setExpandedIdx(expandedIdx === i ? null : i)}
+                >
+                  <span>{item.q}</span>
+                  <ChevronRight size={12} className="help-chevron" />
+                </button>
+                {expandedIdx === i && (
+                  <p className="help-item-a">{item.a}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---- Root ----
 
 export default function App() {
@@ -2799,8 +3350,19 @@ export default function App() {
   const [selectedTargetId, setSelectedTargetId]   = useState<string | null>(null);
   const [overrideSourceId, setOverrideSourceId]   = useState<string | null>(null);
   const [remapSourceId,    setRemapSourceId]       = useState<string | null>(null);
+  const [thresholds, setThresholds]               = useState<ThresholdConfig>(DEFAULT_THRESHOLDS);
 
-  const handleIntakeApply = useCallback(async (sourcePath: string, targetPath: string) => {
+  // When thresholds change, recompute the decision band for all non-manual decisions.
+  // Overlap %, target mapping, rationale, and confidence are NOT changed — only the band label.
+  useEffect(() => {
+    if (!inventory) return;
+    setDecisions(prev => prev.map(d => {
+      if (d.source === 'manual') return d;
+      return { ...d, decision: decisionFromOverlap(d.overlapPercent, thresholds) };
+    }));
+  }, [thresholds, inventory]);
+
+  const handleIntakeApply = useCallback(async (payload: IntakePayload) => {
     setPhase('loading');
     setLoadError(null);
     setDecisions([]);
@@ -2809,7 +3371,7 @@ export default function App() {
     setAnalysisDurationMs(null);
     setPhaseTimings({ loadStartedAt: Date.now() });
     try {
-      const data = await loadReportInventoryFromPaths(sourcePath, targetPath);
+      const data = await loadReportInventoryFromPaths(payload.sourcePath, payload.targetPath);
       const loadDoneAt = Date.now();
       setInventory(data);
       setSelectedSourceId(data.sources[0]?.id ?? null);
@@ -2818,7 +3380,7 @@ export default function App() {
 
       // Decisions are visible IMMEDIATELY from the deterministic overlap matrix.
       // Enrichment only improves rationale/gaps/confidence below - numbers stay locked.
-      const initialDecisions = deterministicDecisions(data);
+      const initialDecisions = deterministicDecisions(data, thresholds);
       setDecisions(initialDecisions);
 
       setPhaseTimings(prev => ({
@@ -2904,7 +3466,10 @@ export default function App() {
         <DashboardView
           inventory={inventory}
           decisions={decisions}
+          thresholds={thresholds}
           onReload={handleIntakeApply}
+          onThresholdChange={setThresholds}
+          onRemap={setRemapSourceId}
           isLoading={phase === 'loading'}
           loadError={loadError}
         />
@@ -2963,6 +3528,7 @@ export default function App() {
           allTargets={targets}
           allDomains={[...new Set(sources.map(r => r.domain))].sort()}
           existing={getSourceDecision(remapSource, decisions)}
+          thresholds={thresholds}
           onClose={() => setRemapSourceId(null)}
           onApply={applyRemap}
         />

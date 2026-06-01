@@ -8,6 +8,7 @@
     "dev:server": "tsx watch server/index.ts",
     "dev:ui": "vite",
     "build": "tsc -p tsconfig.json && vite build",
+    "start": "tsx server/index.ts",
     "preview": "vite preview",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit"
   },

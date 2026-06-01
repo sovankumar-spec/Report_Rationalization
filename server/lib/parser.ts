@@ -42,6 +42,7 @@ export interface ParsedReport {
   queries: ParsedQuery[];
   allKpis: ExtractedKpi[];
   allTables: string[];
+  allDimensions: string[];
 }
 
 // ── path safety ───────────────────────────────────────────────────────────────
@@ -201,8 +202,11 @@ export async function readReportFolder(folderPath: string): Promise<ParsedReport
 
   const allKpis = queries.flatMap(q => q.kpis);
   const allTables = [...new Set(queries.flatMap(q => q.tables))];
+  const allDimensions = [...new Set(
+    queries.flatMap(q => q.groupBy.map(g => g.toLowerCase().replace(/^[\w]+\./g, '').trim())).filter(Boolean),
+  )];
 
-  return { meta, queries, allKpis, allTables };
+  return { meta, queries, allKpis, allTables, allDimensions };
 }
 
 export async function readAllReports(dirPath: string): Promise<ParsedReport[]> {

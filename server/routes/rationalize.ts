@@ -3,17 +3,6 @@ import logger from '../lib/logger.js';
 
 const router = Router();
 
-function extractTextFromResponse(data: Record<string, unknown>): string {
-  if (typeof data.output_text === 'string') return data.output_text;
-  const textParts: string[] = [];
-  for (const item of (data.output as Array<{ content?: Array<{ text?: string }> }>) ?? []) {
-    for (const content of item.content ?? []) {
-      if (typeof content.text === 'string') textParts.push(content.text);
-    }
-  }
-  return textParts.join('\n');
-}
-
 function parseJsonFromText(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -75,7 +64,20 @@ const RESPONSE_SCHEMA = {
   },
 };
 
-async function runRationaleEnrichment(apiKey: string, body: unknown): Promise<unknown> {
+// ---- OpenAI Responses API ------------------------------------------------
+
+function extractOpenAIText(data: Record<string, unknown>): string {
+  if (typeof data.output_text === 'string') return data.output_text;
+  const textParts: string[] = [];
+  for (const item of (data.output as Array<{ content?: Array<{ text?: string }> }>) ?? []) {
+    for (const content of item.content ?? []) {
+      if (typeof content.text === 'string') textParts.push(content.text);
+    }
+  }
+  return textParts.join('\n');
+}
+
+async function runOpenAIEnrichment(apiKey: string, body: unknown): Promise<unknown> {
   const model = process.env.OPENAI_MODEL ?? 'gpt-4.1-mini';
   const upstream = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
@@ -99,21 +101,72 @@ async function runRationaleEnrichment(apiKey: string, body: unknown): Promise<un
 
   if (!upstream.ok) {
     const err = await upstream.json().catch(() => ({}));
-    logger.warn({ status: upstream.status, err }, 'Rationale enrichment provider request failed');
-    throw new Error(`Rationale enrichment request failed with status ${upstream.status}.`);
+    logger.warn({ status: upstream.status, err }, 'OpenAI rationale enrichment failed');
+    throw new Error(`OpenAI enrichment failed with status ${upstream.status}.`);
   }
 
   const data = await upstream.json() as Record<string, unknown>;
-  return parseJsonFromText(extractTextFromResponse(data));
+  return parseJsonFromText(extractOpenAIText(data));
 }
 
-router.post('/', async (req: Request, res: Response, next: NextFunction) => {
-  const apiKey = process.env.OPENAI_API_KEY;
+// ---- DeepSeek chat completions API (OpenAI-compatible) -------------------
 
-  if (!apiKey) {
+async function runDeepSeekEnrichment(apiKey: string, body: unknown): Promise<unknown> {
+  const model = process.env.DEEPSEEK_MODEL ?? 'deepseek-chat';
+  const upstream = await fetch('https://api.deepseek.com/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user',   content: JSON.stringify(body) },
+      ],
+      response_format: { type: 'json_object' },
+      stream: false,
+    }),
+  });
+
+  if (!upstream.ok) {
+    const err = await upstream.json().catch(() => ({}));
+    logger.warn({ status: upstream.status, err }, 'DeepSeek rationale enrichment failed');
+    throw new Error(`DeepSeek enrichment failed with status ${upstream.status}.`);
+  }
+
+  const data = await upstream.json() as { choices?: Array<{ message?: { content?: string } }> };
+  const text = data.choices?.[0]?.message?.content ?? '';
+  if (!text) throw new Error('DeepSeek returned an empty response.');
+  return parseJsonFromText(text);
+}
+
+// ---- Provider selection --------------------------------------------------
+// DeepSeek is checked first; OpenAI is the fallback.
+
+async function runRationaleEnrichment(body: unknown): Promise<unknown> {
+  const deepseekKey = process.env.DEEPSEEK_API_KEY;
+  const openaiKey   = process.env.OPENAI_API_KEY;
+
+  if (deepseekKey) {
+    logger.info('Rationale enrichment: using DeepSeek');
+    return runDeepSeekEnrichment(deepseekKey, body);
+  }
+  if (openaiKey) {
+    logger.info('Rationale enrichment: using OpenAI');
+    return runOpenAIEnrichment(openaiKey, body);
+  }
+  throw new Error('No AI provider configured.');
+}
+
+// ---- Route ---------------------------------------------------------------
+
+router.post('/', async (req: Request, res: Response, next: NextFunction) => {
+  const deepseekKey = process.env.DEEPSEEK_API_KEY;
+  const openaiKey   = process.env.OPENAI_API_KEY;
+
+  if (!deepseekKey && !openaiKey) {
     res.json({
-      status: 'not_configured',
-      message: 'Rationale enrichment is not configured on the server.',
+      status:    'not_configured',
+      message:   'Rationale enrichment is not configured on the server.',
       decisions: [],
     });
     return;
@@ -124,15 +177,13 @@ router.post('/', async (req: Request, res: Response, next: NextFunction) => {
 
   let parsed: unknown;
   try {
-    parsed = await runRationaleEnrichment(apiKey, req.body);
+    parsed = await runRationaleEnrichment(req.body);
   } catch (err) {
-    // Enrichment is optional — fall back gracefully so the client can keep
-    // its deterministic decisions rather than showing a red HTTP 500 banner.
     const msg = err instanceof Error ? err.message : 'Rationale enrichment failed.';
     logger.warn({ requestId, err: msg }, 'Rationale enrichment failed, returning graceful fallback');
     res.json({
-      status:  'error',
-      message: 'Rationale enrichment unavailable — dispositions reflect KPI overlap scoring only.',
+      status:    'error',
+      message:   'Rationale enrichment unavailable — dispositions reflect KPI overlap scoring only.',
       decisions: [],
     });
     return;

@@ -37,6 +37,11 @@ export interface KpiRow {
   codeSnippet?: string;
 }
 
+export interface DimRow {
+  name: string;
+  missingInTarget: boolean;
+}
+
 export interface TargetCandidate {
   id: string;
   name: string;
@@ -64,8 +69,10 @@ export interface FullReport extends SourceReport {
   description: string;
   allKpis: ExtractedKpi[];
   allTables: string[];
+  allDimensions: string[];
   queries: { source: QueryItem[]; target: QueryItem[] };
   kpiDelta: KpiRow[];
+  dimensionDelta: DimRow[];
 }
 
 export interface TargetReport {
@@ -84,6 +91,7 @@ export interface TargetDetailReport {
   queries: QueryItem[];
   kpis: ExtractedKpi[];
   allTables: string[];
+  allDimensions: string[];
 }
 
 export interface ReportInventory {
@@ -102,17 +110,24 @@ export function computeOverlap(src: ParsedReport, tgt: ParsedReport): number {
   const tgtCols    = new Set(tgt.allKpis.map(k => k.column));
   const srcTables  = new Set(src.allTables.map(normaliseTable));
   const tgtTables  = new Set(tgt.allTables.map(normaliseTable));
+  const srcDims    = new Set(src.allDimensions);
+  const tgtDims    = new Set(tgt.allDimensions);
 
   const aliasMatches = [...srcAliases].filter(a => tgtAliases.has(a)).length;
   const colMatches   = [...srcCols].filter(c => tgtCols.has(c)).length;
   const tableMatches = [...srcTables].filter(t => tgtTables.has(t)).length;
+  const dimMatches   = [...srcDims].filter(d => tgtDims.has(d)).length;
 
   const aliasScore = srcAliases.size ? aliasMatches / srcAliases.size : 0;
   const colScore   = srcCols.size    ? colMatches   / srcCols.size    : 0;
   const tableScore = srcTables.size  ? tableMatches / srcTables.size  : 0;
+  const dimScore   = srcDims.size    ? dimMatches   / srcDims.size    : 0;
 
-  // Weighted composite: alias 50%, column 30%, table 20%
-  const raw = aliasScore * 0.50 + colScore * 0.30 + tableScore * 0.20;
+  // When dimension data is available: alias 40%, column 20%, table 15%, dimensions 25%.
+  // When no GROUP BY dims exist, fall back to original weights.
+  const raw = srcDims.size > 0
+    ? aliasScore * 0.40 + colScore * 0.20 + tableScore * 0.15 + dimScore * 0.25
+    : aliasScore * 0.50 + colScore * 0.30 + tableScore * 0.20;
   return Math.min(100, Math.round(raw * 100));
 }
 
@@ -161,13 +176,13 @@ export function buildInventory(
   }));
 
   const targets: TargetDetailReport[] = targetReports.map(tgt => ({
-    id:          tgt.meta.id,
-    name:        tgt.meta.name,
-    domain:      tgt.meta.domain,
-    owner:       tgt.meta.owner ?? 'Unassigned',
-    description: tgt.meta.description ?? `${tgt.meta.name} — reference BI report.`,
-    numQueries:  tgt.queries.length,
-    queries:     tgt.queries.map((q, qi) => ({
+    id:            tgt.meta.id,
+    name:          tgt.meta.name,
+    domain:        tgt.meta.domain,
+    owner:         tgt.meta.owner ?? 'Unassigned',
+    description:   tgt.meta.description ?? `${tgt.meta.name} — reference BI report.`,
+    numQueries:    tgt.queries.length,
+    queries:       tgt.queries.map((q, qi) => ({
       id:           `${tgt.meta.id}_Q${qi + 1}`,
       kpiName:      q.kpiName,
       fullSql:      q.sql,
@@ -177,8 +192,9 @@ export function buildInventory(
       joins:        q.joins,
       groupBy:      q.groupBy,
     })),
-    kpis:      tgt.allKpis,
-    allTables: tgt.allTables,
+    kpis:          tgt.allKpis,
+    allTables:     tgt.allTables,
+    allDimensions: tgt.allDimensions,
   }));
 
   const sources: FullReport[] = [];
@@ -232,6 +248,12 @@ export function buildInventory(
       groupBy:      q.groupBy,
     }));
 
+    const tgtDimSet = new Set(best?.tgt.allDimensions ?? []);
+    const dimDeltaSeen = new Set<string>();
+    const dimensionDelta: DimRow[] = src.allDimensions
+      .filter(d => { if (dimDeltaSeen.has(d)) return false; dimDeltaSeen.add(d); return true; })
+      .map(d => ({ name: d, missingInTarget: !tgtDimSet.has(d) }));
+
     const tgtKpiSet = new Set(best?.tgt.allKpis.map(k => k.alias) ?? []);
     const kpiDeltaSeen = new Set<string>();
     const kpiDelta: KpiRow[] = src.allKpis
@@ -267,8 +289,10 @@ export function buildInventory(
       topCandidates,
       allKpis:             src.allKpis,
       allTables:           src.allTables,
+      allDimensions:       src.allDimensions,
       queries:             { source: sourceQueryItems, target: targetQueryItems },
       kpiDelta,
+      dimensionDelta,
     };
 
     sources.push(full);

@@ -67,6 +67,11 @@ export interface KpiRow {
   codeSnippet?: string;
 }
 
+export interface DimRow {
+  name: string;
+  missingInTarget: boolean;
+}
+
 export interface ExtractedKpi {
   alias: string;
   agg: string;
@@ -79,8 +84,10 @@ export interface FullReport extends SourceReport {
   description: string;
   allKpis: ExtractedKpi[];
   allTables: string[];
+  allDimensions: string[];
   queries: { source: QueryItem[]; target: QueryItem[] };
   kpiDelta: KpiRow[];
+  dimensionDelta: DimRow[];
 }
 
 export interface TargetDetailReport {
@@ -93,6 +100,7 @@ export interface TargetDetailReport {
   queries: QueryItem[];
   kpis: ExtractedKpi[];
   allTables: string[];
+  allDimensions: string[];
 }
 
 export interface Filters {

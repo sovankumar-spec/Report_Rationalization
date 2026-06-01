@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import http from 'http';
+import { fileURLToPath } from 'url';
+import path from 'path';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -32,7 +34,7 @@ app.use(requestId);
 app.use(pinoHttp({ logger, quietReqLogger: true }));
 
 // ── body parsing ──────────────────────────────────────────────────────────────
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '100mb' }));
 
 // ── global rate limit + timeout ───────────────────────────────────────────────
 app.use('/api/', rateLimiter);
@@ -43,10 +45,20 @@ app.use('/api/health',       healthRouter);
 app.use('/api/load-reports', reportsRouter);
 app.use('/api/rationalize',  analyzeRateLimit, rationalizeRouter);
 
-// ── 404 ───────────────────────────────────────────────────────────────────────
-app.use((_req, res) => {
+// ── API 404 ───────────────────────────────────────────────────────────────────
+app.use('/api/', (_req, res) => {
   res.status(404).json({ status: 'error', error: { code: 'NOT_FOUND', message: 'Route not found.' } });
 });
+
+// ── Static file serving (production) ─────────────────────────────────────────
+if (env.nodeEnv === 'production') {
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const distPath  = path.resolve(__dirname, '..', 'dist');
+  app.use(express.static(distPath));
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
+}
 
 // ── error handler (must be last) ─────────────────────────────────────────────
 app.use(errorHandler);

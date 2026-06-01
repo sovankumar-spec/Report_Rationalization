@@ -15,10 +15,13 @@ export function validateEnv(): EnvConfig {
 
   const corsOrigin = process.env.CORS_ORIGIN ?? 'http://localhost:5173';
   const nodeEnv = process.env.NODE_ENV ?? 'development';
-  const enrichmentConfigured = Boolean(process.env.OPENAI_API_KEY);
+  const enrichmentConfigured = Boolean(process.env.DEEPSEEK_API_KEY || process.env.OPENAI_API_KEY);
+  const enrichmentProvider = process.env.DEEPSEEK_API_KEY ? 'deepseek'
+    : process.env.OPENAI_API_KEY ? 'openai'
+    : 'none';
 
   logger.info(
-    { port, corsOrigin, nodeEnv, enrichment: enrichmentConfigured ? 'configured' : 'not_configured' },
+    { port, corsOrigin, nodeEnv, enrichment: enrichmentConfigured ? `configured (${enrichmentProvider})` : 'not_configured' },
     'Environment validated',
   );
 

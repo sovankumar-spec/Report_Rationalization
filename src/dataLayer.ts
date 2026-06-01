@@ -1,4 +1,11 @@
-import { Decision, FullReport, SourceReport, TargetDetailReport, TargetReport } from './types';
+import { Decision, DimRow, FullReport, SourceReport, TargetDetailReport, TargetReport } from './types';
+
+export interface FieldMapping {
+  sourceAlias: string;
+  sourceColumn: string;
+  targetAlias: string | null;
+  targetColumn: string | null;
+}
 
 export interface RationalizationDecision {
   sourceId: string;
@@ -13,6 +20,7 @@ export interface RationalizationDecision {
   kpiGaps: string[];
   status: 'Pending' | 'Approved' | 'Overridden';
   source: 'analysis' | 'manual';
+  fieldMappings?: FieldMapping[];
 }
 
 export interface RationalizationResponse {
@@ -30,18 +38,23 @@ export interface ReportInventory {
   targets: TargetDetailReport[];
 }
 
-/**
- * Load the report inventory by submitting folder paths to the backend.
- * This is the primary runtime data-loading path.
- */
-export async function loadReportInventoryFromPaths(
-  sourcePath: string,
-  targetPath: string,
-): Promise<ReportInventory> {
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = reader.result as string;
+      resolve(result.split(',')[1]);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+async function postLoadReports(body: Record<string, string>): Promise<ReportInventory> {
   const response = await fetch('/api/load-reports', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ sourcePath, targetPath }),
+    body: JSON.stringify(body),
   });
 
   const data = await response.json() as
@@ -59,6 +72,24 @@ export async function loadReportInventoryFromPaths(
     targetIndex: (data as { status: 'ok' } & ReportInventory).targetIndex,
     targets:     (data as { status: 'ok' } & ReportInventory).targets,
   };
+}
+
+export async function loadReportInventoryFromZips(
+  sourceZip: File,
+  targetZip: File,
+): Promise<ReportInventory> {
+  const [sourceBase64, targetBase64] = await Promise.all([
+    fileToBase64(sourceZip),
+    fileToBase64(targetZip),
+  ]);
+  return postLoadReports({ sourceZip: sourceBase64, targetZip: targetBase64 });
+}
+
+export async function loadReportInventoryFromPaths(
+  sourcePath: string,
+  targetPath: string,
+): Promise<ReportInventory> {
+  return postLoadReports({ sourcePath, targetPath });
 }
 
 export function compactSourceReport(report: FullReport) {
@@ -79,7 +110,9 @@ export function compactSourceReport(report: FullReport) {
       bestMatchTargetName: report.bestMatchTargetName,
       confidenceSeed:      report.confidenceScore,
       kpiGapsHeuristic:    report.kpiDelta.filter(k => k.missingInTarget).map(k => k.name),
+      dimGapsHeuristic:    report.dimensionDelta.filter((d: DimRow) => d.missingInTarget).map((d: DimRow) => d.name),
     },
+    dimensions: report.allDimensions,
     kpis: report.allKpis.map(k => ({
       alias: k.alias,
       formula: k.formula,
@@ -108,6 +141,7 @@ export function compactTargetReport(report: TargetDetailReport) {
     description: report.description,
     numQueries: report.numQueries,
     tables: report.allTables,
+    dimensions: report.allDimensions,
     kpis: report.kpis.map(k => ({
       alias: k.alias,
       formula: k.formula,
