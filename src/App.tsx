@@ -267,18 +267,6 @@ function suggestBestMatch(source: string, vocab: string[]): string | null {
   return best.sim >= 0.72 ? best.v : null;
 }
 
-function collectSourceVocab(sources: FullReport[], type: MappingType) {
-  const map = new Map<string, number>();
-  for (const s of sources) {
-    const vals = type === 'kpi'    ? [...new Set(s.allKpis.map(k => k.alias))]
-               : type === 'column' ? [...new Set(s.allKpis.map(k => k.column))]
-               : type === 'table'  ? s.allTables
-               : s.allDimensions;
-    for (const v of vals) map.set(v, (map.get(v) ?? 0) + 1);
-  }
-  return [...map.entries()].map(([value, count]) => ({ value, count }))
-    .sort((a, b) => b.count - a.count || a.value.localeCompare(b.value));
-}
 
 function collectTargetVocab(targets: TargetDetailReport[], type: MappingType): string[] {
   const s = new Set<string>();
@@ -292,6 +280,16 @@ function collectTargetVocab(targets: TargetDetailReport[], type: MappingType): s
   return [...s].sort();
 }
 
+const REMAP_TYPES: MappingType[] = ['dimension', 'kpi', 'column'];
+
+type FieldGroup = {
+  reportId:      string;
+  reportName:    string;
+  domain:        string;
+  fields:        Array<{ value: string; mapped: string; isOk: boolean }>;
+  unresolvedCnt: number;
+};
+
 function MetadataMappingPanel({
   sources, targets, mappings, changedCount, onChange,
 }: {
@@ -301,14 +299,105 @@ function MetadataMappingPanel({
   changedCount: number;
   onChange:     (m: MetadataMapping[]) => void;
 }) {
-  const [open, setOpen]             = useState(false);
-  const [activeType, setActiveType] = useState<MappingType>('kpi');
+  const [open,           setOpen]           = useState(false);
+  const [activeType,     setActiveType]     = useState<MappingType>('dimension');
+  const [search,         setSearch]         = useState('');
+  const [domainFilter,   setDomainFilter]   = useState('');
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
-  const srcVocab = useMemo(() => collectSourceVocab(sources, activeType), [sources, activeType]);
   const tgtVocab = useMemo(() => collectTargetVocab(targets, activeType), [targets, activeType]);
 
-  const getMap = (v: string) =>
-    mappings.find(m => m.type === activeType && m.sourceValue === v)?.targetValue ?? '';
+  const allDomains = useMemo(() => [...new Set(sources.map(s => s.domain))].sort(), [sources]);
+
+  // Build report-grouped hierarchy: per-report unmatched fields (not in target vocab)
+  const groups = useMemo<FieldGroup[]>(() => {
+    return sources.map(src => {
+      const rawFields =
+        activeType === 'kpi'      ? [...new Set(src.allKpis.map(k => k.alias))]
+        : activeType === 'column' ? [...new Set(src.allKpis.map(k => k.column))]
+        : activeType === 'table'  ? [...new Set(src.allTables)]
+        : [...new Set(src.allDimensions)];
+
+      const fields = rawFields
+        .filter(v => !tgtVocab.includes(v))  // only fields not in target vocab
+        .map(value => {
+          const mapped = mappings.find(m => m.type === activeType && m.sourceValue === value)?.targetValue ?? '';
+          return { value, mapped, isOk: mapped ? tgtVocab.includes(mapped) : false };
+        });
+
+      return {
+        reportId:      src.id,
+        reportName:    src.name,
+        domain:        src.domain,
+        fields,
+        unresolvedCnt: fields.filter(f => !f.isOk).length,
+      };
+    }).filter(g => g.fields.length > 0);
+  }, [sources, tgtVocab, mappings, activeType]);
+
+  // Auto-expand groups with unresolved fields when the type tab changes
+  useEffect(() => {
+    setSearch('');
+    setExpandedGroups(new Set(groups.filter(g => g.unresolvedCnt > 0).map(g => g.reportId)));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeType]);
+
+  // Expand all groups that contain a search hit
+  useEffect(() => {
+    if (!search.trim()) return;
+    const q = search.toLowerCase();
+    setExpandedGroups(prev => {
+      const next = new Set(prev);
+      groups.forEach(g => {
+        const nameHit  = g.reportName.toLowerCase().includes(q) || g.reportId.toLowerCase().includes(q);
+        const fieldHit = g.fields.some(f => f.value.toLowerCase().includes(q) || f.mapped.toLowerCase().includes(q));
+        if (nameHit || fieldHit) next.add(g.reportId);
+      });
+      return next;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search]);
+
+  // Filtered view
+  const visibleGroups = useMemo<FieldGroup[]>(() => {
+    const q = search.toLowerCase().trim();
+    return groups
+      .filter(g => !domainFilter || g.domain === domainFilter)
+      .map(g => {
+        if (!q) return g;
+        const nameHit = g.reportName.toLowerCase().includes(q) || g.reportId.toLowerCase().includes(q);
+        return {
+          ...g,
+          fields: nameHit ? g.fields : g.fields.filter(f => f.value.toLowerCase().includes(q) || f.mapped.toLowerCase().includes(q)),
+        };
+      })
+      .filter(g => g.fields.length > 0);
+  }, [groups, domainFilter, search]);
+
+  // Per-type unresolved count for tab badges (deduplicated across reports)
+  const unresolvedCount = useMemo(() => {
+    const result: Record<MappingType, number> = { dimension: 0, kpi: 0, column: 0, table: 0 };
+    for (const t of REMAP_TYPES) {
+      const tv   = new Set(collectTargetVocab(targets, t));
+      const seen = new Set<string>();
+      for (const src of sources) {
+        const fields =
+          t === 'kpi'      ? src.allKpis.map(k => k.alias)
+          : t === 'column' ? src.allKpis.map(k => k.column)
+          : t === 'table'  ? src.allTables
+          : src.allDimensions;
+        for (const v of fields) {
+          if (!seen.has(v) && !tv.has(v) && !mappings.find(m => m.type === t && m.sourceValue === v)) {
+            seen.add(v);
+            result[t]++;
+          }
+        }
+      }
+    }
+    return result;
+  }, [sources, targets, mappings]);
+
+  const totalUnresolved = REMAP_TYPES.reduce((s, t) => s + unresolvedCount[t], 0);
 
   const setMap = (sourceValue: string, targetValue: string) =>
     onChange(targetValue.trim()
@@ -318,114 +407,166 @@ function MetadataMappingPanel({
         ]
       : mappings.filter(m => !(m.type === activeType && m.sourceValue === sourceValue)));
 
-  const suggestAll = () => {
-    const kept: MetadataMapping[] = mappings.filter(m => m.type !== activeType);
-    for (const { value } of srcVocab) {
-      const cur = getMap(value);
-      if (cur) {
-        kept.push({ id: `${activeType}:${value}`, type: activeType, sourceValue: value, targetValue: cur });
-      } else {
-        const sug = suggestBestMatch(value, tgtVocab);
-        if (sug) kept.push({ id: `${activeType}:${value}`, type: activeType, sourceValue: value, targetValue: sug });
-      }
-    }
-    onChange(kept);
-  };
+  const toggleGroup  = (id: string) =>
+    setExpandedGroups(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const expandAll    = () => setExpandedGroups(new Set(visibleGroups.map(g => g.reportId)));
+  const collapseAll  = () => setExpandedGroups(new Set());
 
   if (sources.length === 0) return null;
 
   return (
     <section className="panel mapping-panel">
+      {/* Panel header — clickable to toggle body */}
       <div className="panel-heading mapping-toggle" onClick={() => setOpen(v => !v)} style={{ cursor: 'pointer' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
           <ChevronDown size={14} style={{ transform: open ? 'rotate(180deg)' : undefined, transition: 'transform 0.2s' }} />
           <div>
-            <p className="panel-kicker">Dynamic reprocessing</p>
-            <h2>Metadata remapping</h2>
+            <p className="panel-kicker">Global alias resolution · re-scores all reports live</p>
+            <h2>Field name remapping</h2>
           </div>
         </div>
         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-          {mappings.length > 0 && (
-            <span className="mapping-badge">{mappings.length} mapping{mappings.length !== 1 ? 's' : ''} active</span>
-          )}
-          {changedCount > 0 && (
-            <span className="mapping-badge reclassified">↑ {changedCount} reclassified</span>
-          )}
+          {totalUnresolved > 0 && <span className="mapping-badge gap">{totalUnresolved} unresolved</span>}
+          {mappings.length > 0 && <span className="mapping-badge">{mappings.length} mapping{mappings.length !== 1 ? 's' : ''} active</span>}
+          {changedCount > 0 && <span className="mapping-badge reclassified">↑ {changedCount} reclassified</span>}
         </div>
       </div>
 
       {open && (
         <div className="mapping-body">
-          {/* Type tabs */}
-          <div className="mapping-type-bar">
-            {(Object.keys(MTYPE_LABELS) as MappingType[]).map(t => {
-              const n = mappings.filter(m => m.type === t).length;
-              return (
-                <button
-                  key={t}
-                  className={classNames('mapping-type-btn', activeType === t && 'active')}
-                  onClick={() => setActiveType(t)}
+          {/* ── Toolbar ─────────────────────────────────────────── */}
+          <div className="mapping-toolbar">
+            {/* Type tabs */}
+            <div className="mapping-type-bar">
+              {REMAP_TYPES.map(t => {
+                const unresolved = unresolvedCount[t];
+                const active     = mappings.filter(m => m.type === t).length;
+                return (
+                  <button
+                    key={t}
+                    className={classNames('mapping-type-btn', activeType === t && 'active')}
+                    onClick={e => { e.stopPropagation(); setActiveType(t); }}
+                  >
+                    {MTYPE_LABELS[t]}
+                    {unresolved > 0
+                      ? <span className="mapping-type-dot gap">{unresolved}</span>
+                      : active > 0 ? <span className="mapping-type-dot">{active}</span> : null}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Search + domain filter + expand controls */}
+            <div className="mapping-controls-row">
+              <div className="mapping-search-box">
+                <Search size={12} />
+                <input
+                  value={search}
+                  onChange={e => setSearch(e.target.value)}
+                  placeholder="Search reports or fields…"
+                  onClick={e => e.stopPropagation()}
+                />
+                {search && (
+                  <button className="mapping-search-clear" onClick={e => { e.stopPropagation(); setSearch(''); }}>
+                    <X size={11} />
+                  </button>
+                )}
+              </div>
+
+              {allDomains.length > 1 && (
+                <select
+                  className="mapping-domain-select"
+                  value={domainFilter}
+                  onChange={e => { e.stopPropagation(); setDomainFilter(e.target.value); }}
+                  onClick={e => e.stopPropagation()}
                 >
-                  {MTYPE_LABELS[t]}
-                  {n > 0 && <span className="mapping-type-dot">{n}</span>}
-                </button>
-              );
-            })}
-            <button className="mapping-suggest-all-btn" onClick={suggestAll} title="Auto-suggest best matches for all unmapped source terms">
-              <Sparkles size={11} /> Auto-suggest all
-            </button>
+                  <option value="">All domains</option>
+                  {allDomains.map(d => <option key={d} value={d}>{d}</option>)}
+                </select>
+              )}
+
+              <div className="mapping-expand-btns">
+                <button onClick={e => { e.stopPropagation(); expandAll(); }}>Expand all</button>
+                <button onClick={e => { e.stopPropagation(); collapseAll(); }}>Collapse all</button>
+              </div>
+            </div>
           </div>
 
-          {srcVocab.length === 0 ? (
-            <p className="panel-empty-note">No {MTYPE_LABELS[activeType].toLowerCase()} terms found in source reports.</p>
+          {/* ── Group list ──────────────────────────────────────── */}
+          {visibleGroups.length === 0 ? (
+            <p className="panel-empty-note">
+              {search || domainFilter
+                ? 'No unresolved fields match your search or filter.'
+                : `All ${MTYPE_LABELS[activeType].toLowerCase()} terms match target vocabulary — no remapping needed.`}
+            </p>
           ) : (
-            <div className="mapping-grid">
-              <div className="mapping-grid-hdr">
-                <span>Source {MTYPE_LABELS[activeType]}</span>
-                <span>Reports</span>
-                <span></span>
-                <span>Maps to (target value)</span>
-                <span>Status</span>
-              </div>
-              {srcVocab.map(({ value, count }) => {
-                const mapped     = getMap(value);
-                const directHit  = tgtVocab.includes(value);
-                const mappedHit  = mapped ? tgtVocab.includes(mapped) : false;
-                const sug        = !mapped && !directHit ? suggestBestMatch(value, tgtVocab) : null;
-                const cls        = mapped ? (mappedHit ? 'ok' : 'warn') : directHit ? 'direct' : 'gap';
-                const label      = mapped
-                  ? (mappedHit ? '✓ found'    : '✗ missing')
-                  : directHit ? '✓ direct' : '— no match';
+            <div className="mapping-groups">
+              {visibleGroups.map(group => {
+                const isExpanded = expandedGroups.has(group.reportId);
                 return (
-                  <div key={value} className={`mapping-row ${cls}`}>
-                    <span className="mapping-src-val">{value}</span>
-                    <span className="mapping-rpt-count">{count}×</span>
-                    <span className="mapping-arr">→</span>
-                    <div className="mapping-tgt-cell">
-                      <select
-                        className="mapping-select"
-                        value={mapped}
-                        onChange={e => setMap(value, e.target.value)}
-                      >
-                        <option value="">— no remapping —</option>
-                        {tgtVocab.map(tv => <option key={tv} value={tv}>{tv}</option>)}
-                      </select>
-                      {sug && (
-                        <button className="mapping-sug-chip" onClick={() => setMap(value, sug)} title={`Apply: "${sug}"`}>
-                          <Sparkles size={9} /> {sug}
-                        </button>
-                      )}
+                  <div key={group.reportId} className="mapping-group">
+                    {/* Group header */}
+                    <div
+                      className={classNames('mapping-group-hdr', isExpanded && 'open')}
+                      onClick={e => { e.stopPropagation(); toggleGroup(group.reportId); }}
+                    >
+                      <ChevronDown
+                        size={12}
+                        style={{ transform: isExpanded ? 'rotate(180deg)' : undefined, transition: 'transform 0.15s', flexShrink: 0 }}
+                      />
+                      <span className="mapping-group-name">{group.reportName}</span>
+                      <span className="mapping-group-id">{group.reportId}</span>
+                      <span className="mapping-group-domain">{group.domain}</span>
+                      {group.unresolvedCnt > 0
+                        ? <span className="mapping-group-pill gap">{group.unresolvedCnt} unresolved</span>
+                        : <span className="mapping-group-pill ok">{group.fields.length} mapped</span>}
+                      <span className="mapping-group-total">{group.fields.length} field{group.fields.length !== 1 ? 's' : ''}</span>
                     </div>
-                    <span className={`mapping-status-chip ${cls}`}>{label}</span>
+
+                    {/* Expanded rows */}
+                    {isExpanded && (
+                      <div className="mapping-group-rows">
+                        <div className="mapping-row-hdr">
+                          <span>Source field</span>
+                          <span></span>
+                          <span>Target equivalent</span>
+                          <span>Status</span>
+                        </div>
+                        {group.fields.map(({ value, mapped, isOk }) => {
+                          const cls   = mapped ? (isOk ? 'ok' : 'warn') : 'gap';
+                          const label = mapped ? (isOk ? '✓ mapped' : '⚠ not found') : '✗ unresolved';
+                          return (
+                            <div key={value} className={`mapping-row ${cls}`}>
+                              <span className="mapping-src-val">{value}</span>
+                              <span className="mapping-arr">→</span>
+                              <select
+                                className="mapping-select"
+                                value={mapped}
+                                onChange={e => { e.stopPropagation(); setMap(value, e.target.value); }}
+                                onClick={e => e.stopPropagation()}
+                              >
+                                <option value="">— select target —</option>
+                                {tgtVocab.map(tv => <option key={tv} value={tv}>{tv}</option>)}
+                              </select>
+                              <span className={`mapping-status-chip ${cls}`}>{label}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
                   </div>
                 );
               })}
             </div>
           )}
 
+          {/* Footer: clear active-type mappings */}
           {mappings.filter(m => m.type === activeType).length > 0 && (
             <div className="mapping-footer">
-              <button className="mapping-clear-btn" onClick={() => onChange(mappings.filter(m => m.type !== activeType))}>
+              <button
+                className="mapping-clear-btn"
+                onClick={e => { e.stopPropagation(); onChange(mappings.filter(m => m.type !== activeType)); }}
+              >
                 Clear {MTYPE_LABELS[activeType]} mappings
               </button>
             </div>
@@ -1369,7 +1510,6 @@ function DashboardView({
   // ── Multi-select domain filter ──────────────────────────────────────────
   // activeDomains = [] means "All". Each chip toggles membership in the set.
   const [activeDomains, setActiveDomains] = useState<string[]>([]);
-  const [remapTableOpen, setRemapTableOpen] = useState(false);
   const allDomains = [...new Set(allSources.map(r => r.domain))].sort();
 
   const toggleDomain = (d: string) => {
@@ -1661,68 +1801,6 @@ function DashboardView({
           </div>
         </section>
       </div>
-
-      {/* Quick Remap — collapsible source list with Remap action */}
-      {allSources.length > 0 && !isLoading && (
-        <section className="panel quick-remap-panel">
-          <div className="panel-heading quick-remap-heading" onClick={() => setRemapTableOpen(v => !v)} style={{ cursor: 'pointer' }}>
-            <div>
-              <p className="panel-kicker">Source reports · remap</p>
-              <h2>Quick remap</h2>
-            </div>
-            <span className="panel-badge">{sources.length} source reports</span>
-            <ChevronDown size={14} style={{ transform: remapTableOpen ? 'rotate(180deg)' : undefined, transition: 'transform 0.2s' }} />
-          </div>
-          {remapTableOpen && (
-            <div className="table-scroll">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Source report</th>
-                    <th>Domain</th>
-                    <th>Current reference</th>
-                    <th>Overlap</th>
-                    <th>Disposition</th>
-                    <th>Action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {sources.length === 0 ? (
-                    <tr className="placeholder-row"><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td></tr>
-                  ) : sources.map(src => {
-                    const dec = decisions.find(d => d.sourceId === src.id);
-                    const overlap = dec?.overlapPercent ?? src.overlapPercent;
-                    const targetName = dec?.targetName ?? src.bestMatchTargetName;
-                    const disposition = dec?.decision ?? src.decision;
-                    return (
-                      <tr key={src.id}>
-                        <td>
-                          <strong>{src.name}</strong>
-                          <span className="subtext">{src.id}</span>
-                        </td>
-                        <td>{src.domain}</td>
-                        <td>{targetName ?? <span className="subtext">—</span>}</td>
-                        <td>
-                          <div className="mini-overlap">
-                            <span>{formatPercent(overlap)}</span>
-                            <div><i style={{ width: `${overlap}%`, background: overlapColor(overlap) }} /></div>
-                          </div>
-                        </td>
-                        <td><DecisionPill decision={disposition} /></td>
-                        <td>
-                          <button className="remap-btn" onClick={() => onRemap(src.id)}>
-                            Remap
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-      )}
 
       <HelpChatBox
         tab="dashboard"
@@ -2548,6 +2626,54 @@ function DecisionView({
   );
 }
 
+// ---- Remap modal helpers ----
+// Overlap and gap helpers that honour the FieldMapping[] selections made inside
+// the modal. The alias component resolves source aliases through the mapping
+// before checking coverage, so a manually paired KPI alias counts as matched.
+
+function clientOverlapWithRemapMappings(
+  src: FullReport,
+  tgt: TargetDetailReport,
+  fms: FieldMapping[],
+): number {
+  const aliasMap = new Map(
+    fms.filter(m => m.targetAlias).map(m => [m.sourceAlias, m.targetAlias!]),
+  );
+  const srcAliases = new Set(src.allKpis.map(k => aliasMap.get(k.alias) ?? k.alias));
+  const tgtAliases = new Set(tgt.kpis.map(k => k.alias));
+  const srcCols    = new Set(src.allKpis.map(k => k.column));
+  const tgtCols    = new Set(tgt.kpis.map(k => k.column));
+  const srcTables  = new Set(src.allTables.map(normTable));
+  const tgtTables  = new Set(tgt.allTables.map(normTable));
+  const srcDims    = new Set(src.allDimensions);
+  const tgtDims    = new Set(tgt.allDimensions);
+  const aliasScore = srcAliases.size ? [...srcAliases].filter(a => tgtAliases.has(a)).length / srcAliases.size : 0;
+  const colScore   = srcCols.size    ? [...srcCols].filter(c => tgtCols.has(c)).length    / srcCols.size    : 0;
+  const tableScore = srcTables.size  ? [...srcTables].filter(t => tgtTables.has(t)).length / srcTables.size : 0;
+  const dimScore   = srcDims.size    ? [...srcDims].filter(d => tgtDims.has(d)).length    / srcDims.size    : 0;
+  const raw = srcDims.size > 0
+    ? aliasScore * 0.40 + colScore * 0.20 + tableScore * 0.15 + dimScore * 0.25
+    : aliasScore * 0.50 + colScore * 0.30 + tableScore * 0.20;
+  return Math.min(100, Math.round(raw * 100));
+}
+
+function clientKpiGapsWithRemapMappings(
+  src: FullReport,
+  tgt: TargetDetailReport,
+  fms: FieldMapping[],
+): string[] {
+  const aliasMap = new Map(
+    fms.filter(m => m.targetAlias).map(m => [m.sourceAlias, m.targetAlias!]),
+  );
+  const tgtAliasSet = new Set(tgt.kpis.map(k => k.alias));
+  const seen = new Set<string>();
+  return src.allKpis.filter(k => {
+    if (seen.has(k.alias)) return false;
+    seen.add(k.alias);
+    return !tgtAliasSet.has(aliasMap.get(k.alias) ?? k.alias);
+  }).map(k => k.alias);
+}
+
 // ---- Remap modal ----
 // Lets the user point a source report at a different target domain/report and
 // immediately see the recomputed overlap %, decision band, and KPI gaps before
@@ -2576,7 +2702,7 @@ function RemapModal({
   const [focusKpi,       setFocusKpi]       = useState('');
   const [reason,         setReason]         = useState('');
   const [fieldMappings,  setFieldMappings]  = useState<FieldMapping[]>([]);
-  const [showFieldMap,   setShowFieldMap]   = useState(false);
+  const [showFieldMap,   setShowFieldMap]   = useState(true);
 
   // Build field mappings whenever the resolved target changes.
   const buildFieldMappings = useCallback((tgt: TargetDetailReport | null): FieldMapping[] => {
@@ -2626,9 +2752,9 @@ function RemapModal({
     .sort((a, b) => rankTarget(a) - rankTarget(b));
 
   const newTarget  = allTargets.find(t => t.id === newTargetId) ?? null;
-  const overlap    = newTarget ? clientComputeOverlap(source, newTarget) : 0;
+  const overlap    = newTarget ? clientOverlapWithRemapMappings(source, newTarget, fieldMappings) : 0;
   const decision   = decisionFromOverlap(overlap, thresholds);
-  const kpiGaps    = newTarget ? clientKpiGaps(source, newTarget) : [];
+  const kpiGaps    = newTarget ? clientKpiGapsWithRemapMappings(source, newTarget, fieldMappings) : [];
   const confidence = clientConfidence(overlap);
 
   const sourceKpiAliases = [...new Set(source.allKpis.map(k => k.alias))].sort();
@@ -2636,14 +2762,12 @@ function RemapModal({
     ? newTarget.kpis.some(k => k.alias === focusKpi)
     : null;
 
-  const isDomainChanged  = newDomain   !== (existing?.domain ?? source.domain);
-  const isTargetChanged  = newTargetId !== (existing?.targetId ?? source.bestMatchTargetId);
-  const hasChanges = isDomainChanged || isTargetChanged;
 
   const handleApply = () => {
     const manualMappings = fieldMappings.filter(m => {
-      const isAuto = newTarget?.kpis.some(k => k.alias === m.sourceAlias) ?? false;
-      return !isAuto && m.targetAlias !== null;
+      const hasExactMatch = newTarget?.kpis.some(k => k.alias === m.sourceAlias) ?? false;
+      const isAutoValue = hasExactMatch && m.targetAlias === m.sourceAlias;
+      return !isAutoValue && m.targetAlias !== null;
     });
     onApply({
       sourceId:        source.id,
@@ -2788,9 +2912,10 @@ function RemapModal({
                     <span>Status</span>
                   </div>
                   {fieldMappings.map((fm, i) => {
-                    const isAuto    = newTarget.kpis.some(k => k.alias === fm.sourceAlias);
-                    const isManual  = !isAuto && fm.targetAlias !== null;
-                    const isGap     = !isAuto && fm.targetAlias === null;
+                    const hasExactMatch = newTarget.kpis.some(k => k.alias === fm.sourceAlias);
+                    const isAuto   = hasExactMatch && fm.targetAlias === fm.sourceAlias;
+                    const isManual = !isAuto && fm.targetAlias !== null;
+                    const isGap    = !isAuto && fm.targetAlias === null;
                     const statusCls = isAuto ? 'auto' : isManual ? 'manual' : 'gap';
                     const statusTxt = isAuto ? '✓ auto' : isManual ? '✓ manual' : '✗ gap';
                     return (
@@ -2800,32 +2925,25 @@ function RemapModal({
                           <span className="field-map-col">{fm.sourceColumn}</span>
                         </div>
                         <span className="field-map-arrow">→</span>
-                        {isAuto ? (
-                          <div className="field-map-cell locked">
-                            <span className="field-map-alias">{fm.targetAlias}</span>
-                            <span className="field-map-col">{fm.targetColumn}</span>
-                          </div>
-                        ) : (
-                          <select
-                            className="field-map-select"
-                            value={fm.targetAlias ?? ''}
-                            onChange={e => {
-                              const picked = newTarget.kpis.find(k => k.alias === e.target.value) ?? null;
-                              setFieldMappings(prev => prev.map((m, j) => j !== i ? m : {
-                                ...m,
-                                targetAlias:  picked?.alias  ?? null,
-                                targetColumn: picked?.column ?? null,
-                              }));
-                            }}
-                          >
-                            <option value="">— unmatched —</option>
-                            {newTarget.kpis.map(k => (
-                              <option key={k.alias} value={k.alias}>
-                                {k.alias} ({k.column})
-                              </option>
-                            ))}
-                          </select>
-                        )}
+                        <select
+                          className="field-map-select"
+                          value={fm.targetAlias ?? ''}
+                          onChange={e => {
+                            const picked = newTarget.kpis.find(k => k.alias === e.target.value) ?? null;
+                            setFieldMappings(prev => prev.map((m, j) => j !== i ? m : {
+                              ...m,
+                              targetAlias:  picked?.alias  ?? null,
+                              targetColumn: picked?.column ?? null,
+                            }));
+                          }}
+                        >
+                          <option value="">— unmatched —</option>
+                          {newTarget.kpis.map(k => (
+                            <option key={k.alias} value={k.alias}>
+                              {k.alias} ({k.column})
+                            </option>
+                          ))}
+                        </select>
                         <span className={`field-map-status ${statusCls}`}>{statusTxt}</span>
                       </div>
                     );
@@ -2890,9 +3008,9 @@ function RemapModal({
           <button onClick={onClose}>Cancel</button>
           <button
             className="primary-action"
-            disabled={!newTarget || !hasChanges}
+            disabled={!newTarget}
             onClick={handleApply}
-            title={!hasChanges ? 'Change at least one field to apply remap' : undefined}
+            title={!newTarget ? 'Select a reference report first' : undefined}
           >
             Apply remap
           </button>
